@@ -218,3 +218,9 @@ csrc/third_party/
 
 # claude code skills
 .claude/skills/*
+
+
+bes-resource/ubuntu22.04/offline-resource/apt/
+bes-resource/ubuntu22.04/offline-resource/mooncake-deps/
+bes-resource/ubuntu22.04/offline-resource/pip/
+bes-resource/ubuntu22.04/offline-resource/code/
