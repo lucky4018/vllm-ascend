@@ -28,6 +28,10 @@ RESOURCE_DIR="${SCRIPT_DIR}/offline-resource"
 PROJECT_ROOT="$(cd "$(dirname "$(dirname "$SCRIPT_DIR")")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/logs"
 
+# 基础镜像 (需与 Dockerfile.offline 中的 FROM 保持一致)
+# apt 离线包必须在该 Ubuntu 镜像内下载，保证与构建容器完全匹配
+BASE_IMAGE="quay.io/ascend/cann:9.0.0-910b-ubuntu22.04-py3.11"
+
 # 版本配置
 VLLM_REPO="https://github.com/lucky4018/vllm.git"
 VLLM_BRANCH="bes/v0.20.2"
@@ -92,61 +96,68 @@ init_directories() {
 # ============================================================================
 
 download_apt_packages() {
-    log_section "下载 apt 离线包"
+    log_section "下载 apt 离线包 (通过 Ubuntu 容器)"
 
     local apt_dir="${RESOURCE_DIR}/apt"
     local apt_list_file="${LOG_DIR}/apt_packages_list.txt"
 
     # 基础包列表 (来自 Dockerfile)
-    local base_packages=(
-        git vim wget net-tools gcc g++ cmake numactl libnuma-dev libjemalloc2 clang-15
-    )
+    local base_packages="git vim wget net-tools gcc g++ cmake numactl libnuma-dev libjemalloc2 clang-15"
 
     # Mooncake 依赖包列表 (来自 mooncake_installer.sh)
-    local mooncake_packages=(
-        build-essential cmake git wget unzip
-        libibverbs-dev libgoogle-glog-dev libgtest-dev libjsoncpp-dev
-        libunwind-dev libnuma-dev libpython3-dev libboost-all-dev libssl-dev
-        libgrpc-dev libgrpc++-dev libprotobuf-dev libyaml-cpp-dev
-        protobuf-compiler-grpc libcurl4-openssl-dev libhiredis-dev
-        pkg-config patchelf mpich libmpich-dev libgflags-dev libgflags2.2
-    )
+    local mooncake_packages="build-essential cmake git wget unzip \
+        libibverbs-dev libgoogle-glog-dev libgtest-dev libjsoncpp-dev \
+        libunwind-dev libnuma-dev libpython3-dev libboost-all-dev libssl-dev \
+        libgrpc-dev libgrpc++-dev libprotobuf-dev libyaml-cpp-dev \
+        protobuf-compiler-grpc libcurl4-openssl-dev libhiredis-dev \
+        pkg-config patchelf mpich libmpich-dev libgflags-dev libgflags2.2"
 
     # 合并所有包
-    local all_packages=("${base_packages[@]}" "${mooncake_packages[@]}")
+    local all_packages="${base_packages} ${mooncake_packages}"
 
-    log_info "需要下载的包: ${all_packages[*]}"
+    log_info "需要下载的包: ${all_packages}"
     echo "=== apt 包列表 ===" > "$apt_list_file"
-    echo "${all_packages[*]}" >> "$apt_list_file"
+    echo "${all_packages}" >> "$apt_list_file"
 
-    # 更新 apt 缓存
-    log_info "更新 apt 缓存..."
-    sudo apt-get update -y
+    # openEuler 宿主机没有 apt，改为在与构建容器一致的 Ubuntu 镜像内下载 .deb 包
+    log_info "使用基础镜像下载 deb 包: ${BASE_IMAGE}"
+    if ! docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
+        log_info "本地无基础镜像，尝试拉取..."
+        docker pull "$BASE_IMAGE" || {
+            log_error "基础镜像拉取失败，无法下载 apt 包"
+            return 1
+        }
+    fi
 
-    # 下载包及其依赖
-    log_info "下载 apt 包及其依赖..."
-    cd "$apt_dir"
+    # 在 Ubuntu 容器内下载 deb 包及其全部依赖，通过挂载卷输出到宿主机 apt 目录
+    # --download-only: 只下载不安装，包+依赖会落到 /var/cache/apt/archives
+    docker run --rm \
+        -v "${apt_dir}:/apt-out" \
+        -e ALL_PACKAGES="${all_packages}" \
+        -e HOST_UID="$(id -u)" \
+        -e HOST_GID="$(id -g)" \
+        "$BASE_IMAGE" \
+        bash -c '
+            set -e
+            apt-get update -y
+            # 下载显式依赖包 + 镜像中尚未安装的传递依赖
+            apt-get install -y --download-only ${ALL_PACKAGES}
+            cp -f /var/cache/apt/archives/*.deb /apt-out/ 2>/dev/null || true
+            # 交还宿主机用户属主，避免生成 root 属主文件
+            chown -R "${HOST_UID}:${HOST_GID}" /apt-out
+        ' 2>&1 | tee "${LOG_DIR}/apt_download.log"
 
-    for pkg in "${all_packages[@]}"; do
-        log_info "下载包: $pkg"
-        # 使用 apt-get download 下载包 (需要 sudo 来访问 apt 缓存)
-        sudo apt-get download "$pkg" 2>/dev/null || log_warn "包 $pkg 下载失败，可能已存在"
-
-        # 下载依赖
-        local deps=$(apt-cache depends "$pkg" 2>/dev/null | grep "Depends:" | awk '{print $2}' | head -20)
-        for dep in $deps; do
-            sudo apt-get download "$dep" 2>/dev/null || true
-        done
-    done
+    if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+        log_error "容器内 apt 包下载失败，请查看日志: ${LOG_DIR}/apt_download.log"
+        return 1
+    fi
 
     # 统计下载的包数量
-    local pkg_count=$(ls -1 *.deb 2>/dev/null | wc -l)
+    local pkg_count=$(ls -1 "${apt_dir}"/*.deb 2>/dev/null | wc -l)
     log_info "apt 包下载完成，共 $pkg_count 个包"
 
     echo "=== 下载的包列表 ===" >> "$apt_list_file"
-    ls -1 *.deb >> "$apt_list_file" 2>/dev/null || true
-
-    cd - > /dev/null
+    ls -1 "${apt_dir}"/*.deb >> "$apt_list_file" 2>/dev/null || true
 }
 
 # ============================================================================
@@ -306,7 +317,7 @@ precheck_resources() {
     local apt_count=$(ls -1 "${RESOURCE_DIR}/apt/"*.deb 2>/dev/null | wc -l)
     if [ "$apt_count" -lt 50 ]; then
         log_error "apt 包数量不足: $apt_count (预期至少 50)"
-        ((errors++))
+        errors=$((errors+1))
     else
         log_info "apt 包数量: $apt_count ✓"
     fi
@@ -316,21 +327,21 @@ precheck_resources() {
         log_info "vllm 代码目录完整 ✓"
     else
         log_error "vllm 代码不完整"
-        ((errors++))
+        errors=$((errors+1))
     fi
 
     if [ -d "${RESOURCE_DIR}/code/Mooncake/.git" ]; then
         log_info "Mooncake 代码目录完整 ✓"
     else
         log_error "Mooncake 代码不完整"
-        ((errors++))
+        errors=$((errors+1))
     fi
 
     # 3. 检查 pip 包目录
     local common_count=$(ls -1 "${RESOURCE_DIR}/pip/common"/*.whl "${RESOURCE_DIR}/pip/common"/*.tar.gz 2>/dev/null | wc -l)
     if [ "$common_count" -lt 3 ]; then
         log_warn "common pip 包数量较少: $common_count"
-        ((warnings++))
+        warnings=$((warnings+1))
     else
         log_info "common pip 包数量: $common_count ✓"
     fi
@@ -338,7 +349,7 @@ precheck_resources() {
     local vllm_count=$(ls -1 "${RESOURCE_DIR}/pip/vllm"/*.whl "${RESOURCE_DIR}/pip/vllm"/*.tar.gz 2>/dev/null | wc -l)
     if [ "$vllm_count" -lt 10 ]; then
         log_warn "vllm pip 包数量较少: $vllm_count"
-        ((warnings++))
+        warnings=$((warnings+1))
     else
         log_info "vllm pip 包数量: $vllm_count ✓"
     fi
@@ -346,7 +357,7 @@ precheck_resources() {
     local vllm_ascend_count=$(ls -1 "${RESOURCE_DIR}/pip/vllm-ascend"/*.whl "${RESOURCE_DIR}/pip/vllm-ascend"/*.tar.gz 2>/dev/null | wc -l)
     if [ "$vllm_ascend_count" -lt 10 ]; then
         log_warn "vllm-ascend pip 包数量较少: $vllm_ascend_count"
-        ((warnings++))
+        warnings=$((warnings+1))
     else
         log_info "vllm-ascend pip 包数量: $vllm_ascend_count ✓"
     fi
@@ -355,7 +366,7 @@ precheck_resources() {
     local torch_found=$(ls "${RESOURCE_DIR}/pip/vllm-ascend"/torch-2.10.0* 2>/dev/null | wc -l)
     if [ "$torch_found" -eq 0 ]; then
         log_error "缺少 torch 包"
-        ((errors++))
+        errors=$((errors+1))
     else
         log_info "torch 包存在 ✓"
     fi
@@ -363,7 +374,7 @@ precheck_resources() {
     local torch_npu_found=$(ls "${RESOURCE_DIR}/pip/vllm-ascend"/torch_npu-2.10.0* 2>/dev/null | wc -l)
     if [ "$torch_npu_found" -eq 0 ]; then
         log_error "缺少 torch-npu 包"
-        ((errors++))
+        errors=$((errors+1))
     else
         log_info "torch-npu 包存在 ✓"
     fi
@@ -374,7 +385,7 @@ precheck_resources() {
         log_info "Go 存在 ✓"
     else
         log_error "缺少 Go"
-        ((errors++))
+        errors=$((errors+1))
     fi
 
     local yalantinglibs_file="yalantinglibs-${YALANTINGLIBS_VERSION}.zip"
@@ -382,7 +393,7 @@ precheck_resources() {
         log_info "yalantinglibs 存在 ✓"
     else
         log_error "缺少 yalantinglibs"
-        ((errors++))
+        errors=$((errors+1))
     fi
 
     # 5. 检查 Dockerfile.offline
@@ -390,7 +401,7 @@ precheck_resources() {
         log_info "Dockerfile.offline 存在 ✓"
     else
         log_error "缺少 Dockerfile.offline"
-        ((errors++))
+        errors=$((errors+1))
     fi
 
     # 总结
@@ -427,21 +438,21 @@ apply_changecode() {
     if [ -d "${changecode_dir}/vllm" ] && [ "$(ls -A ${changecode_dir}/vllm 2>/dev/null)" ]; then
         log_info "应用 vllm 代码修改..."
         cp -rf "${changecode_dir}/vllm/"* "${RESOURCE_DIR}/code/vllm/" 2>/dev/null || true
-        ((applied++))
+        applied=$((applied+1))
     fi
 
     # 复制到 Mooncake 代码
     if [ -d "${changecode_dir}/Mooncake" ] && [ "$(ls -A ${changecode_dir}/Mooncake 2>/dev/null)" ]; then
         log_info "应用 Mooncake 代码修改..."
         cp -rf "${changecode_dir}/Mooncake/"* "${RESOURCE_DIR}/code/Mooncake/" 2>/dev/null || true
-        ((applied++))
+        applied=$((applied+1))
     fi
 
     # 复制到 vllm-ascend 代码 (复制到项目根目录)
     if [ -d "${changecode_dir}/vllm-ascend" ] && [ "$(ls -A ${changecode_dir}/vllm-ascend 2>/dev/null)" ]; then
         log_info "应用 vllm-ascend 代码修改..."
         cp -rf "${changecode_dir}/vllm-ascend/"* "${PROJECT_ROOT}/" 2>/dev/null || true
-        ((applied++))
+        applied=$((applied+1))
     fi
 
     if [ "$applied" -eq 0 ]; then
