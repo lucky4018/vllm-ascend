@@ -54,6 +54,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.utils import extract_layer_index
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import GET_META_MSG
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
@@ -260,18 +261,46 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.ready_event = ready_event
         self.callback_func = callback_func
 
+        # === Async transfer support ===
+        self._use_async_transfer = ascend_envs.VLLM_MOONCAKE_ASYNC_TRANSFER
+        logger.info("KVCacheSendingLayerThread: async transfer=%s (set via VLLM_MOONCAKE_ASYNC_TRANSFER)",
+                     self._use_async_transfer)
+        if self._use_async_transfer:
+            self._pending_async_transfers: dict[int, tuple[str, str, str, float]] = {}
+            self._pending_async_lock = threading.Lock()
+            self._async_poll_interval = 0.001  # 1ms
+        else:
+            self._async_poll_interval = 0.001
+
     def run(self):
         local_rank = get_world_group().local_rank
         device = torch.device(f"npu:{local_rank}")
         torch.npu.set_device(device)
         self.ready_event.set()
+        last_poll_time = time.perf_counter()
         while True:
-            send_task = self.send_queue.get()
-            self._handle_request(send_task)
+            try:
+                # Poll async transfers periodically
+                now = time.perf_counter()
+                if self._use_async_transfer and now - last_poll_time >= self._async_poll_interval:
+                    self._poll_and_complete_async()
+                    last_poll_time = now
+
+                # Try to get a new task from the queue (non-blocking with short timeout)
+                try:
+                    send_task = self.send_queue.get(timeout=self._async_poll_interval)
+                    self._handle_request(send_task)
+                except queue.Empty:
+                    pass
+            except Exception as e:
+                logger.error("Error in KVCacheSendingLayerThread: %s", e)
 
     def _handle_request(self, send_task: SendTask):
         try:
-            self._transfer_kv_cache(send_task)
+            if self._use_async_transfer:
+                self._transfer_kv_cache_async(send_task)
+            else:
+                self._transfer_kv_cache(send_task)
         except Exception as e:
             logger.error("Failed to transfer KV cache for layer idx %s, %s", send_task.layer_idx, e)
 
@@ -296,6 +325,8 @@ class KVCacheSendingLayerThread(threading.Thread):
             local_conv_addr, local_ssm_addr = local_layer_metadata.kv_caches_base_addr
             remote_conv_addr, remote_ssm_addr = remote_layer_metadata.kv_caches_base_addr
             local_conv_len, local_ssm_len = local_layer_metadata.block_len
+            if req_meta.remote_tp_size is None:
+                return []
             tp_ratio = self.tp_size // req_meta.remote_tp_size
             if tp_ratio == 1:
                 src_list.extend(
@@ -511,6 +542,121 @@ class KVCacheSendingLayerThread(threading.Thread):
                             else:
                                 self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=True)
 
+    def _transfer_kv_cache_async(self, send_task: SendTask):
+        """Submit KV cache transfer asynchronously."""
+        layer_name = send_task.layer_name
+        layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
+        key = send_task.k_cache
+        value = send_task.v_cache
+        if self.pd_head_ratio > 1 and key is not None and value is not None:
+            with npu_stream_switch(self.resharding_stream):
+                key = key.view(-1, key.shape[-1])
+                value = value.view(-1, key.shape[-1])
+                self.k_buffer[: key.shape[0]].copy_(key)
+                self.v_buffer[: value.shape[0]].copy_(value)
+        if send_task.k_quant_cache is not None:
+            with npu_stream_switch(self.resharding_stream):
+                key_quant = send_task.k_quant_cache
+                key_quant = key_quant.view(-1, key_quant.shape[-1])
+                self.k_buffer[: key_quant.shape[0]].copy_(key_quant)
+                value_quant = send_task.v_quant_cache
+                value_quant = value_quant.view(-1, value_quant.shape[-1])
+                self.v_buffer[: value_quant.shape[0]].copy_(value_quant)
+
+        # Merge transmission tasks of the same session
+        session_meta: dict[str, TransferMeta] = {}
+        for req_id, req_meta in send_task.send_request.items():
+            session_id = f"{req_meta.remote_host}:{req_meta.remote_te_rpc_port}"
+            if session_id not in session_meta:
+                session_meta[session_id] = TransferMeta(src=[], dst=[], length=[], req_ids=[])
+
+            (src_list, dst_list, length_list) = self.get_transfer_meta(send_task, req_id, req_meta, layer_group_idx)
+
+            session_meta[session_id].src.extend(src_list)
+            session_meta[session_id].dst.extend(dst_list)
+            session_meta[session_id].length.extend(length_list)
+            session_meta[session_id].req_ids.append(req_id)
+
+        if send_task.k_quant_cache is not None:
+            self.resharding_stream.synchronize()
+        elif self.pd_head_ratio == 1:
+            send_task.wait_event.synchronize()
+        elif self.pd_head_ratio > 1:
+            self.resharding_stream.synchronize()
+
+        for session_id, transfer_meta in session_meta.items():
+            if len(transfer_meta.src) > 0:
+                req_start_time = time.perf_counter()
+                batch_id = self.engine.batch_transfer_async_write(
+                    session_id, transfer_meta.src, transfer_meta.dst, transfer_meta.length
+                )
+                if batch_id is None or batch_id <= 0:
+                    logger.error(
+                        "Mooncake async transfer failed for send requests %s kv cache to %s, batch_id=%s",
+                        transfer_meta.req_ids,
+                        session_id,
+                        batch_id,
+                    )
+                    for req_id in transfer_meta.req_ids:
+                        self.failed_reqs.add(req_id)
+                else:
+                    req_end_time = time.perf_counter()
+                    total_transfer_size = sum(transfer_meta.length) / 1024
+                    req_transfer_elapsed = (req_end_time - req_start_time) * 1000
+                    logger.debug(
+                        "Layer%d KV cache async transfer task %dKB to remote_session_id [%s] took %.3f ms, batch_id=%s.",
+                        send_task.layer_idx,
+                        total_transfer_size,
+                        session_id,
+                        req_transfer_elapsed,
+                        batch_id,
+                    )
+                    # Register pending async transfer
+                    with self._pending_async_lock:
+                        self._pending_async_transfers[batch_id] = (
+                            str(transfer_meta.req_ids),
+                            session_id,
+                            f"layer{send_task.layer_idx}",
+                            req_start_time,
+                        )
+
+    def _poll_and_complete_async(self):
+        """Poll pending async writes and fire callbacks for completed ones."""
+        with self._pending_async_lock:
+            batch_ids = list(self._pending_async_transfers.keys())
+            if not batch_ids:
+                return
+
+        # We need to track which batch_ids belong to which send_task.
+        # Since _pending_async_transfers stores (req_ids, session_id, ...),
+        # we poll all pending batch_ids together.
+        try:
+            result = self.engine.get_batch_transfer_status(batch_ids)
+        except Exception as e:
+            logger.error("Error polling async write transfer status: %s", e)
+            with self._pending_async_lock:
+                for batch_id in batch_ids:
+                    if batch_id in self._pending_async_transfers:
+                        req_ids, session_id, _, _ = self._pending_async_transfers.pop(batch_id)
+                        logger.warning("Marked async write batch_id %s as failed due to poll error", batch_id)
+            return
+
+        if result != 0:
+            return  # not all complete yet
+
+        completed = []
+        with self._pending_async_lock:
+            for batch_id in batch_ids:
+                if batch_id in self._pending_async_transfers:
+                    req_ids_str, session_id, label, req_start_time = self._pending_async_transfers.pop(batch_id)
+                    completed.append(batch_id)
+                    req_end_time = time.perf_counter()
+                    req_transfer_elapsed = (req_end_time - req_start_time) * 1000
+                    logger.debug(
+                        "Async write batch_id=%s (%s) completed, took %.2f ms",
+                        batch_id, label, req_transfer_elapsed,
+                    )
+
 
 class KVCacheRecvingLayerThread(threading.Thread):
     def __init__(
@@ -654,13 +800,13 @@ class MooncakeLayerwiseConnectorMetadata(KVConnectorMetadata):
             remote_block_size=kv_transfer_params.get("remote_block_size", []),
             remote_engine_id=kv_transfer_params.get("remote_engine_id"),
             remote_host=kv_transfer_params.get("remote_host"),
-            remote_port=kv_transfer_params.get("remote_port"),
+            remote_port=kv_transfer_params.get("remote_port", 0),
             remote_te_rpc_port=kv_transfer_params.get("remote_te_rpc_port"),
             remote_layer_metadata=kv_transfer_params.get("remote_layer_metadata"),
             metaserver=kv_transfer_params.get("metaserver"),
-            remote_tp_size=kv_transfer_params.get("remote_tp_size"),
-            remote_pcp_size=kv_transfer_params.get("remote_pcp_size"),
-            remote_dcp_size=kv_transfer_params.get("remote_dcp_size"),
+            remote_tp_size=kv_transfer_params.get("remote_tp_size", 1),
+            remote_pcp_size=kv_transfer_params.get("remote_pcp_size", 1),
+            remote_dcp_size=kv_transfer_params.get("remote_dcp_size", 1),
             do_virtual=kv_transfer_params.get("do_virtual"),
             chunk_finish=chunk_finish,
             remote_cache_tokens=remote_cache_tokens,
@@ -902,7 +1048,7 @@ class MooncakeLayerwiseConnectorScheduler:
             logger.debug(
                 "MooncakeLayerwiseConnector update_state_after_alloc: add %s to need send queue", request.request_id
             )
-            remote_cache_tokens = params["remote_cached_tokens"]
+            remote_cache_tokens = params.get("remote_cached_tokens", 0)
             local_transferred_tokens = remote_cache_tokens
             local_computed_tokens = 0
             self._reqs_need_send_layerwise[request.request_id] = SendReqInfo(
@@ -973,7 +1119,7 @@ class MooncakeLayerwiseConnectorScheduler:
                             kv_transfer_params=request.kv_transfer_params,
                             token_ids=[],
                             chunk_finish=chunk_finish,
-                            remote_cache_tokens=request.kv_transfer_params.get("remote_cached_tokens"),
+                            remote_cache_tokens=request.kv_transfer_params.get("remote_cached_tokens", 0),
                             prompt_len=len(request.all_token_ids),
                             local_computed_tokens=local_computed_tokens,
                             local_transed_tokens=local_transed_tokens,
@@ -987,7 +1133,7 @@ class MooncakeLayerwiseConnectorScheduler:
                                 len(request.all_token_ids),
                                 local_computed_tokens,
                                 local_transed_tokens,
-                                request.kv_transfer_params.get("remote_cached_tokens"),
+                                request.kv_transfer_params.get("remote_cached_tokens", 0),
                                 chunk_finish,
                                 local_block_ids,
                                 request.kv_transfer_params.get("remote_block_ids"),
@@ -1348,6 +1494,8 @@ class MooncakeLayerwiseConnectorWorker:
         remote_tp_size = req_meta.remote_tp_size
         remote_hosts = [req_meta.remote_host]
         remote_port = req_meta.remote_port
+        if remote_port is None or remote_tp_size is None:
+            return {}
         local_transed_tokens = max(req_meta.remote_cache_tokens, req_meta.local_transed_tokens)
         # local_transed_tokens tokens that have already been transmitted on the local side
         local_computed_tokens = req_meta.local_computed_tokens
@@ -1476,6 +1624,8 @@ class MooncakeLayerwiseConnectorWorker:
         remote_block_ids = req_meta.remote_block_ids
         for i in range(self.num_kv_cache_groups):
             if isinstance(self.kv_cache_specs[i], MambaSpec):
+                continue
+            if i >= len(remote_block_size) or i >= len(remote_block_ids):
                 continue
             if remote_block_size[i] != self.block_size[i] and len(req_meta.remote_block_ids[i]) > 0:
                 assert remote_block_size[i] > self.block_size[i] and remote_block_size[i] % self.block_size[i] == 0, (
