@@ -114,6 +114,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
+    # Whether to use Mooncake async KV cache transfer (batch_transfer_async_read)
+    # Default is 0 (sync). Set to 1 to enable async/non-blocking transfer.
+    "VLLM_MOONCAKE_ASYNC_TRANSFER": lambda: bool(int(os.getenv("VLLM_MOONCAKE_ASYNC_TRANSFER", "0"))),
 }
 
 # end-env-vars-definition
