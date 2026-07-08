@@ -2131,6 +2131,12 @@ def group_concurrent_contiguous(
     src: list[int], dst: list[int]
 ) -> tuple[list[npt.NDArray[np.int64]], list[npt.NDArray[np.int64]]]:
     """Vectorised NumPy implementation."""
+    # Truncate the longer list to ensure src and dst have the same length
+    min_len = min(len(src), len(dst))
+    if len(src) != len(dst):
+        src = src[:min_len]
+        dst = dst[:min_len]
+
     src_indices: npt.NDArray[np.int64] = np.array(src, dtype=np.int64)
     dst_indices: npt.NDArray[np.int64] = np.array(dst, dtype=np.int64)
 
