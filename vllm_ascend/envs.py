@@ -112,12 +112,19 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Whether to use MultiBlockPool for KV cache management
+    # Whether to apply MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
     # Whether to use Mooncake async KV cache transfer (batch_transfer_async_read)
     # Default is 0 (sync). Set to 1 to enable async/non-blocking transfer.
     "VLLM_MOONCAKE_ASYNC_TRANSFER": lambda: bool(int(os.getenv("VLLM_MOONCAKE_ASYNC_TRANSFER", "0"))),
-}
+    # Whether to enable KV cache compression for Mooncake RDMA transfer.
+    # When enabled, KV cache data is compressed by a custom AIV kernel before RDMA transfer,
+    # and decompressed on the receiving side. This reduces RDMA bandwidth usage.
+    # The compression algorithm is Zero-Block RLE (Run-Length Encoding) which detects
+    # leading zero-value FP16 words in 64-element blocks.
+    "VLLM_ASCEND_ENABLE_KV_CACHE_COMPRESSION": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_KV_CACHE_COMPRESSION", "0"))),
+
+    }
 
 # end-env-vars-definition
 

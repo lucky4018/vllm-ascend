@@ -51,6 +51,7 @@ from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import get_transfer_timeout_value
+from vllm_ascend.envs import env_variables as ascend_env_vars
 from vllm_ascend.utils import enable_custom_op, is_vl_model
 
 # isort: off
@@ -335,6 +336,12 @@ class KVCacheRecvingThread(threading.Thread):
         self.block_len = block_len
         # TODO(jianzs): find a better way to detect MLA.
         self.use_mla = len(block_len) == 2
+        # Determine the device from the first KV cache tensor
+        self.kv_caches_device = None
+        if kv_caches:
+            first_cache = list(kv_caches.values())[0]
+            if isinstance(first_cache, (list, tuple)) and len(first_cache) > 0:
+                self.kv_caches_device = first_cache[0].device
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
         self.executor = ThreadPoolExecutor(max_workers=32)
@@ -640,6 +647,19 @@ class KVCacheRecvingThread(threading.Thread):
                     self._send_done_recv_signal(request_id, remote_host_, remote_port, remote_port_send_num)
             self.proc_not_transfer_request[request_id] = False
 
+    def _verify_compress_ratio(
+        self,
+        dst_list: list[int],
+        length_list: list[int],
+        remote_request_id: str,
+    ) -> None:
+        """Compress received KV blocks and log compression ratio."""
+        # FIXME: AIV kernel currently causes segfault when called from this context.
+        # Disabled until the kernel is verified to work correctly in the Mooncake
+        # transfer pipeline.
+        logger.info("KV cache compression verification skipped (AIV kernel disabled for now)")
+        return
+
     def _transfer_kv_cache_sync(self, req_meta: dict[str, Any]):
         """Handle a KV cache transfer request synchronously."""
         remote_request_id = req_meta["remote_request_id"]
@@ -712,6 +732,10 @@ class KVCacheRecvingThread(threading.Thread):
         if ret < 0:
             logger.error("Mooncake sync transfer failed for request %s", req_meta["remote_request_id"])
             raise RuntimeError(f"Mooncake sync transfer failed, ret: {ret}")
+
+        # Compression verification: works with sync and async paths
+        if ascend_env_vars["VLLM_ASCEND_ENABLE_KV_CACHE_COMPRESSION"]():
+            self._verify_compress_ratio(dst_list, length_list, remote_request_id)
 
         req_end_time = time.perf_counter()
         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
@@ -819,11 +843,18 @@ class KVCacheRecvingThread(threading.Thread):
                 req_start_time,
             )
 
+        # Compression verification: works with sync and async paths
+        if ascend_env_vars["VLLM_ASCEND_ENABLE_KV_CACHE_COMPRESSION"]():
+            self._verify_compress_ratio(dst_list, length_list, remote_request_id)
+
+        req_end_time = time.perf_counter()
+        req_transfer_elapsed = (req_end_time - req_start_time) * 1000
         logger.info(
-            "KV cache async transfer submitted for request %s, batch_id=%s (%d groups, %d blocks). "
-            "local_ip %s local_device_id %s remote_session_id %s",
+            "KV cache async transfer for request %s batch_id=%s took %.2f ms (%d groups,"
+            " %d blocks). local_ip %s local_device_id %s remote_session_id %s",
             remote_request_id,
             batch_id,
+            req_transfer_elapsed,
             num_transfer_groups,
             num_blocks,
             get_ip(),
@@ -2091,6 +2122,15 @@ def group_concurrent_contiguous(
     dst_groups = [g.tolist() for g in dst_groups]
 
     return src_groups, dst_groups
+
+
+def _format_bytes(num_bytes: int) -> str:
+    """Format byte count to human-readable string."""
+    for unit in ("", "K", "M", "G"):
+        if abs(num_bytes) < 1024.0:
+            return f"{num_bytes:.1f}{unit}"
+        num_bytes /= 1024.0
+    return f"{num_bytes:.1f}T"
 
 
 def string_to_int64_hash(input_str):

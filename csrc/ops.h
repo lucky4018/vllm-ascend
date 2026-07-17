@@ -145,4 +145,27 @@ namespace vllm_ascend {
         void* gm_tiling_data,
         const uint32_t block_dim
     );
+
+    extern void kv_rle_compress_impl(
+        void* stream,
+        void* input,
+        void* compressed_output,
+        uint32_t* compressed_size,
+        uint32_t num_elements);
+
+    extern void kv_rle_decompress_impl(
+        void* stream,
+        void* compressed_input,
+        uint32_t* compressed_size,
+        void* output,
+        uint32_t num_elements);
+
+    // aclrtlaunch functions for direct kernel launch (bypass <<<>>> syntax)
+    extern "C" uint32_t aclrtlaunch_kv_rle_compress_kernel(
+        uint32_t numBlocks, void* stream,
+        void* input, void* output, void* output_size, uint32_t num_elements);
+
+    extern "C" uint32_t aclrtlaunch_kv_rle_decompress_kernel(
+        uint32_t numBlocks, void* stream,
+        void* input, void* input_size, void* output, uint32_t num_elements);
 }

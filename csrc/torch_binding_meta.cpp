@@ -106,7 +106,30 @@ void batch_matmul_transpose(const at::Tensor &tensor_a, const at::Tensor &tensor
 {
     return;
 }
+
 #endif
+
+#ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
+static constexpr int64_t KVRLE_BLOCK_WORDS = 64;
+
+std::tuple<at::Tensor, at::Tensor> kv_rle_compress_meta(at::Tensor &input) {
+    const int64_t num_elements = input.numel();
+    const int64_t num_blocks = (num_elements + KVRLE_BLOCK_WORDS - 1) / KVRLE_BLOCK_WORDS;
+    const int64_t max_block_size = 1 + KVRLE_BLOCK_WORDS * sizeof(int16_t);
+    const int64_t max_output_size = sizeof(int32_t) + num_blocks * max_block_size;
+
+    auto options = input.options().dtype(torch::kUInt8);
+    at::Tensor compressed = at::empty_symint({max_output_size}, options);
+    at::Tensor compressed_size = at::empty_symint({1}, options.dtype(torch::kInt32));
+    return std::make_tuple(compressed, compressed_size);
+}
+
+at::Tensor kv_rle_decompress_meta(at::Tensor &compressed, at::Tensor &compressed_size, int64_t num_elements) {
+    auto options = compressed.options().dtype(torch::kHalf);
+    return at::empty_symint({num_elements}, options);
+}
+
+#endif  // VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
 
 void device_print_meta(c10::string_view msg)
 {
@@ -1646,6 +1669,13 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("chunk_gated_delta_rule_fwd_h", &vllm_ascend::meta::chunk_gated_delta_rule_fwd_h_meta);
     // chunk_fwd_o
     ops.impl("chunk_fwd_o", &vllm_ascend::meta::chunk_fwd_o_meta);
+
+#ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
+    // kv_rle_compress
+    ops.impl("kv_rle_compress", &vllm_ascend::meta::kv_rle_compress_meta);
+    // kv_rle_decompress
+    ops.impl("kv_rle_decompress", &vllm_ascend::meta::kv_rle_decompress_meta);
+#endif
 }
 }
 #endif

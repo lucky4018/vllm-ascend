@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import shlex
 from collections.abc import Mapping, Sequence
-from typing import Any, cast
+from typing import Any, cast, Union
 
 import regex as re
 
 from tools.docs_codegen.errors import make_docs_codegen_error
 
-ScalarValue = str | int | float | bool | None
+ScalarValue = Union[str, int, float, bool, None]
 
 # Braced ``${VAR}`` template variables, mirroring runtime.py:TEMPLATE_VAR_RE.
 TEMPLATE_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")

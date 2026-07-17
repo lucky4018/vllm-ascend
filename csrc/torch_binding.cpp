@@ -588,6 +588,140 @@ at::Tensor sgmv_expand(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indic
     cmd.Run();
     return y_out;
 }
+
+// ============================================================
+// KV Cache RLE Compress / Decompress - CPU Implementation
+// ============================================================
+#ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
+
+static constexpr int32_t KVRLE_BLOCK_WORDS = 64;
+
+// CPU implementation of Zero-Block RLE compression
+// No AIV kernel needed - runs on CPU directly
+
+static uint32_t kv_rle_compress_cpu(
+    const uint16_t* input, uint8_t* output,
+    uint32_t* output_size, uint32_t num_elements)
+{
+    uint32_t write_offset = sizeof(uint32_t);  // reserve space for total_size
+
+    uint32_t num_blocks = (num_elements + KVRLE_BLOCK_WORDS - 1) / KVRLE_BLOCK_WORDS;
+
+    for (uint32_t b = 0; b < num_blocks; ++b) {
+        uint32_t start = b * KVRLE_BLOCK_WORDS;
+        uint32_t remaining = num_elements - start;
+        uint32_t n = (remaining < KVRLE_BLOCK_WORDS) ? remaining : KVRLE_BLOCK_WORDS;
+
+        // Count leading zeros
+        uint32_t lz = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            if (input[start + i] == 0) { lz++; }
+            else { break; }
+        }
+
+        if (lz == n) {
+            // All-zero block: header 0xFF, no payload
+            output[write_offset++] = 0xFF;
+        } else {
+            // Header byte = leading zero count
+            output[write_offset++] = (uint8_t)(lz & 0x3F);
+            // Copy non-zero payload
+            uint32_t payload = n - lz;
+            memcpy(output + write_offset, input + start + lz, payload * sizeof(uint16_t));
+            write_offset += payload * sizeof(uint16_t);
+        }
+    }
+
+    // Write total_size at the beginning
+    uint32_t* total_size_ptr = reinterpret_cast<uint32_t*>(output);
+    total_size_ptr[0] = write_offset;
+    if (output_size) output_size[0] = write_offset;
+
+    return write_offset;
+}
+
+static void kv_rle_decompress_cpu(
+    const uint8_t* input, uint32_t* input_size,
+    uint16_t* output, uint32_t num_elements)
+{
+    uint32_t total_size = input_size ? input_size[0] : 0;
+    if (total_size == 0) {
+        // Fallback: read from first 4 bytes of input
+        const uint32_t* size_ptr = reinterpret_cast<const uint32_t*>(input);
+        total_size = size_ptr[0];
+    }
+
+    uint32_t rd = sizeof(uint32_t);  // skip total_size
+    uint32_t wo = 0;
+
+    while (wo < num_elements && rd < total_size) {
+        uint8_t header = input[rd++];
+        uint32_t lz = (header == 0xFF) ? KVRLE_BLOCK_WORDS : (header & 0x3F);
+
+        uint32_t remaining = num_elements - wo;
+        uint32_t n = (remaining < KVRLE_BLOCK_WORDS) ? remaining : KVRLE_BLOCK_WORDS;
+        uint32_t payload = (n > lz) ? (n - lz) : 0;
+
+        // Write leading zeros
+        for (uint32_t i = 0; i < lz && wo < num_elements; ++i) {
+            output[wo++] = 0;
+        }
+
+        // Copy payload
+        if (payload > 0 && rd + payload * sizeof(uint16_t) <= total_size) {
+            memcpy(output + wo, input + rd, payload * sizeof(uint16_t));
+            wo += payload;
+            rd += payload * sizeof(uint16_t);
+        }
+    }
+}
+
+std::tuple<at::Tensor, at::Tensor> kv_rle_compress(at::Tensor& input)
+{
+    at::ScalarType scalar_type = input.scalar_type();
+    TORCH_CHECK(scalar_type == torch::kHalf, "kv_rle_compress only supports float16");
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(input.device().is_cpu(), "input must be on CPU");
+
+    const int64_t num_elements = input.numel();
+    const int64_t num_blocks = (num_elements + KVRLE_BLOCK_WORDS - 1) / KVRLE_BLOCK_WORDS;
+    const int64_t max_block_size = 1 + KVRLE_BLOCK_WORDS * sizeof(uint16_t);
+    const int64_t max_output_size = sizeof(uint32_t) + num_blocks * max_block_size;
+
+    at::Tensor compressed = at::zeros({max_output_size}, at::dtype(torch::kUInt8));
+    at::Tensor compressed_size = at::zeros({1}, at::dtype(torch::kInt32));
+
+    const uint16_t* input_data = reinterpret_cast<const uint16_t*>(input.data_ptr());
+    uint8_t* output_data = compressed.data_ptr<uint8_t>();
+    int32_t* size_data_int = compressed_size.data_ptr<int32_t>();
+    uint32_t* size_data = reinterpret_cast<uint32_t*>(size_data_int);
+
+    kv_rle_compress_cpu(input_data, output_data, size_data, static_cast<uint32_t>(num_elements));
+
+    return std::make_tuple(compressed, compressed_size);
+}
+
+at::Tensor kv_rle_decompress(at::Tensor& compressed, at::Tensor& compressed_size, int64_t num_elements)
+{
+    TORCH_CHECK(compressed.dtype() == torch::kUInt8, "compressed must be uint8");
+    TORCH_CHECK(compressed_size.dtype() == torch::kInt32, "compressed_size must be int32");
+    TORCH_CHECK(compressed.is_contiguous(), "compressed must be contiguous");
+    TORCH_CHECK(compressed_size.numel() == 1, "compressed_size must be scalar");
+    TORCH_CHECK(compressed.device().is_cpu(), "compressed must be on CPU");
+
+    at::Tensor output = at::empty({num_elements}, at::dtype(torch::kHalf));
+
+    const uint8_t* compressed_data = compressed.data_ptr<uint8_t>();
+    const int32_t* size_data_int = compressed_size.data_ptr<int32_t>();
+    const uint32_t* size_data = reinterpret_cast<const uint32_t*>(size_data_int);
+    uint16_t* output_data = reinterpret_cast<uint16_t*>(output.data_ptr());
+
+    kv_rle_decompress_cpu(compressed_data, const_cast<uint32_t*>(size_data),
+                          output_data, static_cast<uint32_t>(num_elements));
+
+    return output;
+}
+
 #endif
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> dispatch_prefill(
@@ -2951,5 +3085,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "chunk_fwd_o(Tensor q, Tensor k, Tensor v, Tensor h, float scale, *, Tensor? g=None, Tensor? g_gamma=None, int[]? cu_seqlens=None, int[]? chunk_indices=None, int? chunk_size=None, bool? transpose_state_layout=False) -> Tensor"
     );
     ops.impl("chunk_fwd_o", torch::kPrivateUse1, &vllm_ascend::chunk_fwd_o);
-}
-#endif
+
+#ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
+    ops.def(
+        "kv_rle_compress(Tensor input) -> (Tensor compressed, Tensor compressed_size)"
+    );
+    ops.impl("kv_rle_compress", torch::kPrivateUse1, &vllm_ascend::kv_rle_compress);
+
+    ops.def(
+        "kv_rle_decompress(Tensor compressed, Tensor compressed_size, int num_elements) -> (Tensor output)"
+    );
+    ops.impl("kv_rle_decompress", torch::kPrivateUse1, &vllm_ascend::kv_rle_decompress);
+#endif  // VLLM_ENABLE_ATB_AND_DIRECT_KERNELS (3027)
+}  // TORCH_LIBRARY_EXPAND (else branch)
+#endif  // ASCEND_PLATFORM_310P
+#endif  // VLLM_ENABLE_ATB_AND_DIRECT_KERNELS (244)
